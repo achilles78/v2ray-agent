@@ -141,6 +141,9 @@ initVar() {
 	# 当前的个性化安装方式 01234
 	currentInstallProtocolType=
 
+	# 当前alpn的顺序
+	currentAlpn=
+
 	# 前置类型
 	frontingType=
 
@@ -247,6 +250,98 @@ readInstallProtocolType() {
 	done < <(find ${configPath} -name "*inbounds.json" | awk -F "[.]" '{print $1}')
 }
 
+# 读取当前alpn的顺序
+readInstallAlpn() {
+	if [[ -n ${currentInstallProtocolType} ]]; then
+		local alpn
+		alpn=$(jq -r .inbounds[0].streamSettings.xtlsSettings.alpn[0] ${configPath}${frontingType}.json)
+		if [[ -n ${alpn} ]]; then
+			currentAlpn=${alpn}
+		fi
+	fi
+}
+
+# 检查防火墙
+allowPort() {
+	# 如果防火墙启动状态则添加相应的开放端口
+	if systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
+		local updateFirewalldStatus=
+		if ! iptables -L | grep -q "http(mack-a)"; then
+			updateFirewalldStatus=true
+			iptables -I INPUT -p tcp --dport 80 -m comment --comment "allow http(mack-a)" -j ACCEPT
+		fi
+
+		if ! iptables -L | grep -q "https(mack-a)"; then
+			updateFirewalldStatus=true
+			iptables -I INPUT -p tcp --dport 443 -m comment --comment "allow https(mack-a)" -j ACCEPT
+		fi
+
+		if echo "${updateFirewalldStatus}" | grep -q "true"; then
+			netfilter-persistent save
+		fi
+	elif systemctl status ufw 2>/dev/null | grep -q "active (exited)"; then
+		if ! ufw status | grep -q 443; then
+			sudo ufw allow https
+			checkUFWAllowPort 443
+		fi
+
+		if ! ufw status | grep -q 80; then
+			sudo ufw allow 80
+			checkUFWAllowPort 80
+		fi
+	elif systemctl status firewalld 2>/dev/null | grep -q "active (running)"; then
+		local updateFirewalldStatus=
+		if ! firewall-cmd --list-ports --permanent | grep -qw "80/tcp"; then
+			updateFirewalldStatus=true
+			firewall-cmd --zone=public --add-port=80/tcp --permanent
+			checkFirewalldAllowPort 80
+		fi
+
+		if ! firewall-cmd --list-ports --permanent | grep -qw "443/tcp"; then
+			updateFirewalldStatus=true
+			firewall-cmd --zone=public --add-port=443/tcp --permanent
+			checkFirewalldAllowPort 443
+		fi
+		if echo "${updateFirewalldStatus}" | grep -q "true"; then
+			firewall-cmd --reload
+		fi
+	fi
+}
+
+# 检查80、443端口占用情况
+checkPortUsedStatus() {
+	if lsof -i tcp:80 | grep -q LISTEN; then
+		echoContent red "\n ---> 80端口被占用，请手动关闭后安装\n"
+		lsof -i tcp:80 | grep LISTEN
+		exit 0
+	fi
+
+	if lsof -i tcp:443 | grep -q LISTEN; then
+		echoContent red "\n ---> 443端口被占用，请手动关闭后安装\n"
+		lsof -i tcp:80 | grep LISTEN
+		exit 0
+	fi
+}
+
+# 输出ufw端口开放状态
+checkUFWAllowPort() {
+	if ufw status | grep -q "$1"; then
+		echoContent green " ---> $1端口开放成功"
+	else
+		echoContent red " ---> $1端口开放失败"
+		exit 0
+	fi
+}
+
+# 输出ufw端口开放状态
+checkFirewalldAllowPort() {
+	if firewall-cmd --list-ports --permanent | grep -q "$1"; then
+		echoContent green " ---> $1端口开放成功"
+	else
+		echoContent red " ---> $1端口开放失败"
+		exit 0
+	fi
+}
 # 检查文件目录以及path路径
 readConfigHostPathUUID() {
 	currentPath=
@@ -380,6 +475,7 @@ checkCPUVendor
 readInstallType
 readInstallProtocolType
 readConfigHostPathUUID
+readInstallAlpn
 
 # -------------------------------------------------------------
 
@@ -483,6 +579,11 @@ installTools() {
 	if ! find /usr/bin /usr/sbin | grep -q -w lsb-release; then
 		echoContent green " ---> 安装lsb-release"
 		${installType} lsb-release >/dev/null 2>&1
+	fi
+
+	if ! find /usr/bin /usr/sbin | grep -q -w lsof; then
+		echoContent green " ---> 安装lsof"
+		${installType} lsof >/dev/null 2>&1
 	fi
 
 	# 检测nginx版本，并提供是否卸载的选项
@@ -824,25 +925,27 @@ checkIP() {
 		echoContent yellow " ---> 如解析正确，请等待dns生效，预计三分钟内生效"
 		echoContent yellow " ---> 如以上设置都正确，请重新安装纯净系统后再次尝试"
 		if [[ -n ${localIP} ]]; then
-			echoContent yellow " ---> 检测返回值异常"
+			echoContent yellow " ---> 检测返回值异常，建议手动卸载nginx后重新执行脚本"
 		fi
-		echoContent red " ---> 请检查防火墙是否关闭\n"
-		read -r -p "是否通过脚本关闭防火墙？[y/n]:" disableFirewallStatus
-		if [[ ${disableFirewallStatus} == "y" ]]; then
-			handleFirewall stop
+		echoContent red " ---> 请检查防火墙规则是否开放443、80\n"
+		read -r -p "是否通过脚本修改防火墙规则开放443、80端口？[y/n]:" allPortFirewallStatus
+		if [[ ${allPortFirewallStatus} == "y" ]]; then
+			allowPort
+			handleNginx start
+			checkIP
+		else
+			exit 0
 		fi
-
-		exit 0
+	else
+		if echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q "." || echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q ":"; then
+			echoContent red "\n ---> 检测到多个ip，请确认是否关闭cloudflare的云朵"
+			echoContent yellow " ---> 关闭云朵后等待三分钟后重试"
+			echoContent yellow " ---> 检测到的ip如下：[${localIP}]"
+			exit 0
+		fi
+		echoContent green " ---> 当前域名ip为：[${localIP}]"
 	fi
 
-	if echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q "." || echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q ":"; then
-		echoContent red "\n ---> 检测到多个ip，请确认是否关闭cloudflare的云朵"
-		echoContent yellow " ---> 关闭云朵后等待三分钟后重试"
-		echoContent yellow " ---> 检测到的ip如下：[${localIP}]"
-		exit 0
-	fi
-
-	echoContent green " ---> 当前域名ip为：[${localIP}]"
 }
 # 安装TLS
 installTLS() {
@@ -850,17 +953,11 @@ installTLS() {
 	local tlsDomain=${domain}
 	# 安装tls
 	if [[ -f "/etc/v2ray-agent/tls/${tlsDomain}.crt" && -f "/etc/v2ray-agent/tls/${tlsDomain}.key" && -n $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]] || [[ -d "$HOME/.acme.sh/${tlsDomain}_ecc" && -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" && -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" ]]; then
-		# 存在证书
 		echoContent green " ---> 检测到证书"
-		checkTLStatus "${tlsDomain}"
-		if [[ "${tlsStatus}" == "已过期" ]]; then
-			rm -rf "$HOME/.acme.sh/${tlsDomain}_ecc/*"
-			rm -rf "/etc/v2ray-agent/tls/${tlsDomain}*"
-			installTLS "$1"
-		else
-			echoContent green " ---> 证书有效"
-			#
-			if [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.crt") ]] || [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.key") ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]]; then
+		#		checkTLStatus
+		renewalTLS
+
+		if [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.crt") ]] || [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.key") ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]]; then
 				sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
 			else
 				echoContent yellow " ---> 如未过期请选择[n]\n"
@@ -869,8 +966,8 @@ installTLS() {
 					rm -rf /etc/v2ray-agent/tls/*
 					installTLS "$1"
 				fi
-			fi
 		fi
+
 	elif [[ -d "$HOME/.acme.sh" ]] && [[ ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" || ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" ]]; then
 		echoContent green " ---> 安装TLS证书"
 		if echo "${localIP}" | grep -q ":"; then
@@ -888,8 +985,8 @@ installTLS() {
 				echoContent red " ---> TLS安装失败，请检查acme日志"
 				exit 0
 			fi
-			echoContent red " ---> TLS安装失败，检查防火墙中"
-			handleFirewall stop
+			echoContent red " ---> TLS安装失败，正在检查80、443端口是否开放"
+			allowPort
 			echoContent yellow " ---> 重新尝试安装TLS证书"
 			installTLSCount=1
 			installTLS "$1"
@@ -1004,7 +1101,9 @@ installCronTLS() {
 
 # 更新证书
 renewalTLS() {
-	echoContent skyBlue "\n进度  1/1 : 更新证书"
+	if [[ -n $1 ]]; then
+		echoContent skyBlue "\n进度  $1/1 : 更新证书"
+	fi
 
 	if [[ -d "$HOME/.acme.sh/${currentHost}_ecc" ]] && [[ -f "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.key" ]] && [[ -f "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.cer" ]]; then
 		modifyTime=$(stat "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.cer" | sed -n '7,6p' | awk '{print $2" "$3" "$4" "$5}')
@@ -1042,24 +1141,23 @@ renewalTLS() {
 # 查看TLS证书的状态
 checkTLStatus() {
 
-	if [[ -n "$1" ]]; then
-		if [[ -d "$HOME/.acme.sh/$1_ecc" ]] && [[ -f "$HOME/.acme.sh/$1_ecc/$1.key" ]] && [[ -f "$HOME/.acme.sh/$1_ecc/$1.cer" ]]; then
-			modifyTime=$(stat "$HOME/.acme.sh/$1_ecc/$1.key" | sed -n '7,6p' | awk '{print $2" "$3" "$4" "$5}')
+	if [[ -d "$HOME/.acme.sh/${currentHost}_ecc" ]] && [[ -f "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.key" ]] && [[ -f "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.cer" ]]; then
+		modifyTime=$(stat "$HOME/.acme.sh/${currentHost}_ecc/${currentHost}.cer" | sed -n '7,6p' | awk '{print $2" "$3" "$4" "$5}')
 
-			modifyTime=$(date +%s -d "${modifyTime}")
-			currentTime=$(date +%s)
-			((stampDiff = currentTime - modifyTime))
-			((days = stampDiff / 86400))
-			((remainingDays = 90 - days))
+		modifyTime=$(date +%s -d "${modifyTime}")
+		currentTime=$(date +%s)
+		((stampDiff = currentTime - modifyTime))
+		((days = stampDiff / 86400))
+		((remainingDays = 90 - days))
 
-			tlsStatus=${remainingDays}
-			if [[ ${remainingDays} -le 0 ]]; then
-				tlsStatus="已过期"
-			fi
-			echoContent skyBlue " ---> 证书生成日期:$(date -d "@${modifyTime}" +"%F %H:%M:%S")"
-			echoContent skyBlue " ---> 证书生成天数:${days}"
-			echoContent skyBlue " ---> 证书剩余天数:${tlsStatus}"
+		tlsStatus=${remainingDays}
+		if [[ ${remainingDays} -le 0 ]]; then
+			tlsStatus="已过期"
 		fi
+
+		echoContent skyBlue " ---> 证书生成日期:$(date -d "@${modifyTime}" +"%F %H:%M:%S")"
+		echoContent skyBlue " ---> 证书生成天数:${days}"
+		echoContent skyBlue " ---> 证书剩余天数:${tlsStatus}"
 	fi
 }
 
@@ -1172,7 +1270,7 @@ v2rayVersionManageMenu() {
 	echoContent yellow "4.打开v2ray-core"
 	echoContent yellow "5.重启v2ray-core"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectV2RayType
+	read -r -p "请选择:" selectV2RayType
 	if [[ "${selectV2RayType}" == "1" ]]; then
 		updateV2Ray
 	elif [[ "${selectV2RayType}" == "2" ]]; then
@@ -1215,7 +1313,7 @@ xrayVersionManageMenu() {
 	echoContent yellow "4.打开Xray-core"
 	echoContent yellow "5.重启Xray-core"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectXrayType
+	read -r -p "请选择:" selectXrayType
 	if [[ "${selectXrayType}" == "1" ]]; then
 		updateXray
 	elif [[ "${selectXrayType}" == "2" ]]; then
@@ -1902,7 +2000,7 @@ initXrayFrontingConfig() {
 
 	echoContent yellow "1.切换至${xtlsType}"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectType
+	read -r -p "请选择:" selectType
 	if [[ "${selectType}" == "1" ]]; then
 
 		if [[ "${xtlsType}" == "Trojan" ]]; then
@@ -2634,7 +2732,7 @@ updateNginxBlog() {
 	echoContent yellow "8.个人博客02"
 	echoContent yellow "9.404自动跳转baidu"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectInstallNginxBlogType
+	read -r -p "请选择:" selectInstallNginxBlogType
 
 	if [[ "${selectInstallNginxBlogType}" =~ ^[1-9]$ ]]; then
 		#		rm -rf /usr/share/nginx/html
@@ -2668,7 +2766,7 @@ addCorePort() {
 	echoContent yellow "1.添加端口"
 	echoContent yellow "2.删除端口"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectNewPortType
+	read -r -p "请选择:" selectNewPortType
 	if [[ "${selectNewPortType}" == "1" ]]; then
 		read -r -p "请输入端口号：" newPort
 		if [[ -n "${newPort}" ]]; then
@@ -2804,7 +2902,7 @@ manageUser() {
 	echoContent yellow "1.添加用户"
 	echoContent yellow "2.删除用户"
 	echoContent skyBlue "-----------------------------------------------------"
-	read -r -p "请选择：" manageUserType
+	read -r -p "请选择:" manageUserType
 	if [[ "${manageUserType}" == "1" ]]; then
 		addUser
 	elif [[ "${manageUserType}" == "2" ]]; then
@@ -3065,7 +3163,7 @@ bbrInstall() {
 	echoContent yellow "1.安装脚本【推荐原版BBR+FQ】"
 	echoContent yellow "2.回退主目录"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" installBBRStatus
+	read -r -p "请选择:" installBBRStatus
 	if [[ "${installBBRStatus}" == "1" ]]; then
 		wget -N --no-check-certificate "https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
 	else
@@ -3100,7 +3198,7 @@ checkLog() {
 	echoContent yellow "6.清空日志"
 	echoContent red "=============================================================="
 
-	read -r -p "请选择：" selectAccessLogType
+	read -r -p "请选择:" selectAccessLogType
 	local configPathLog=${configPath//conf\//}
 
 	case ${selectAccessLogType} in
@@ -3950,7 +4048,7 @@ selectCoreInstall() {
 	echoContent yellow "1.Xray-core"
 	echoContent yellow "2.v2ray-core"
 	echoContent red "=============================================================="
-	read -r -p "请选择：" selectCoreType
+	read -r -p "请选择:" selectCoreType
 	case ${selectCoreType} in
 	1)
 		if [[ "${selectInstallType}" == "2" ]]; then
@@ -4024,7 +4122,7 @@ xrayCoreInstall() {
 	handleNginx stop
 	randomPathFunction 5
 	# 安装Xray
-	handleV2Ray stop
+	# handleV2Ray stop
 	installXray 6
 	installXrayService 7
 	customCDNIP 8
@@ -4123,12 +4221,54 @@ subscribe() {
 	fi
 }
 
+# 切换alpn
+switchAlpn() {
+	echoContent skyBlue "\n功能 1/${totalProgress} : 切换alpn"
+	if [[ -z ${currentAlpn} ]]; then
+		echoContent red " ---> 无法读取alpn，请检查是否安装"
+		exit 0
+	fi
+
+	echoContent red "\n=============================================================="
+	echoContent green "当前alpn首位为：${currentAlpn}"
+	echoContent yellow "  1.当http/1.1首位时，trojan可用，gRPC部分客户端可用【客户端支持手动选择alpn的可用】"
+	echoContent yellow "  2.当h2首位时，gRPC可用，trojan部分客户端可用【客户端支持手动选择alpn的可用】"
+	echoContent yellow "  3.如客户端不支持手动更换alpn，建议使用此功能更改服务端alpn顺序，来使用相应的协议"
+	echoContent red "=============================================================="
+
+	if [[ "${currentAlpn}" == "http/1.1" ]]; then
+		echoContent yellow "1.切换alpn h2 首位"
+	elif [[ "${currentAlpn}" == "h2" ]]; then
+		echoContent yellow "1.切换alpn http/1.1 首位"
+	else
+		echoContent red '不符合'
+	fi
+
+	echoContent red "=============================================================="
+
+	read -r -p "请选择:" selectSwitchAlpnType
+	if [[ "${selectSwitchAlpnType}" == "1" && "${currentAlpn}" == "http/1.1" ]]; then
+
+		local frontingTypeJSON
+		frontingTypeJSON=$(jq -r ".inbounds[0].streamSettings.xtlsSettings.alpn = [\"h2\",\"http/1.1\"]" ${configPath}${frontingType}.json)
+		echo "${frontingTypeJSON}" | jq . >${configPath}${frontingType}.json
+
+	elif [[ "${selectSwitchAlpnType}" == "1" && "${currentAlpn}" == "h2" ]]; then
+		local frontingTypeJSON
+		frontingTypeJSON=$(jq -r ".inbounds[0].streamSettings.xtlsSettings.alpn =[\"http/1.1\",\"h2\"]" ${configPath}${frontingType}.json)
+		echo "${frontingTypeJSON}" | jq . >${configPath}${frontingType}.json
+	else
+		echoContent red " ---> 选择错误"
+		exit 0
+	fi
+	reloadCore
+}
 # 主菜单
 menu() {
 	cd "$HOME" || exit
 	echoContent red "\n=============================================================="
 	echoContent green "作者：mack-a"
-	echoContent green "当前版本：v2.5.33"
+	echoContent green "当前版本：v2.5.36"
 	echoContent green "Github：https://github.com/mack-a/v2ray-agent"
 	echoContent green "描述：八合一共存脚本\c"
 	showInstallStatus
@@ -4145,6 +4285,7 @@ menu() {
 	elif echo ${currentInstallProtocolType} | grep -q 0; then
 		echoContent yellow "3.切换Trojan[XTLS]"
 	fi
+
 	echoContent skyBlue "-------------------------工具管理-----------------------------"
 	echoContent yellow "4.账号管理"
 	echoContent yellow "5.更换伪装站"
@@ -4155,13 +4296,14 @@ menu() {
 	echoContent yellow "10.流媒体工具"
 	echoContent yellow "11.添加新端口"
 	echoContent yellow "12.BT下载管理"
+	echoContent yellow "13.切换alpn"
 	echoContent skyBlue "-------------------------版本管理-----------------------------"
-	echoContent yellow "13.core管理"
-	echoContent yellow "14.更新脚本"
-	echoContent yellow "15.安装BBR、DD脚本"
+	echoContent yellow "14.core管理"
+	echoContent yellow "15.更新脚本"
+	echoContent yellow "16.安装BBR、DD脚本"
 	echoContent skyBlue "-------------------------脚本管理-----------------------------"
-	echoContent yellow "16.查看日志"
-	echoContent yellow "17.卸载脚本"
+	echoContent yellow "17.查看日志"
+	echoContent yellow "18.卸载脚本"
 	echoContent red "=============================================================="
 	mkdirTools
 	aliasInstall
@@ -4204,18 +4346,21 @@ menu() {
 		btTools 1
 		;;
 	13)
-		coreVersionManageMenu 1
+		switchAlpn 1
 		;;
 	14)
-		updateV2RayAgent 1
+		coreVersionManageMenu 1
 		;;
 	15)
-		bbrInstall
+		updateV2RayAgent 1
 		;;
 	16)
-		checkLog 1
+		bbrInstall
 		;;
 	17)
+		checkLog 1
+		;;
+	18)
 		unInstall 1
 		;;
 	esac
