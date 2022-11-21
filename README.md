@@ -19,8 +19,6 @@
 # 目录
 
 - [1.脚本安装](#1vlesstcptlsvlesswstlsvmesstcptlsvmesswstlstrojan-伪装站点-五合一共存脚本)
-    - [组合方式](#组合方式)
-    - [组合推荐](#组合推荐)
     - [特性](#特性)
     - [注意事项](#注意事项)
     - [安装脚本](#安装脚本)
@@ -35,7 +33,7 @@
 - 支持[Xray-core[XTLS]](https://github.com/XTLS/Xray-core)、[v2ray-core](https://github.com/v2fly/v2ray-core)
 - 支持VLESS/Trojan前置[VLESS XTLS -> Trojan XTLS]、[Trojan XTLS -> VLESS XTLS]
 - 支持不同核心之间的配置文件互相读取
-- 支持 VLESS/VMess/trojan 协议
+- 支持 VLESS/VMess/trojan/hysteria 协议
 - 支持Debian、Ubuntu、Centos系统，支持主流的cpu架构。
 - 支持任意组合安装、支持多用户管理、支持DNS流媒体解锁、支持添加多端口、[支持任意门解锁Netflix](https://github.com/mack-a/v2ray-agent/blob/master/documents/netflix/dokodemo-unblock_netflix.md)
 - 支持卸载后保留tls证书
@@ -47,11 +45,11 @@
 ## 支持的安装类型
 
 - VLESS+TCP+TLS
-- VLESS+TCP+xtls-rprx-direct【**推荐**】
+- VLESS+TCP+xtls-rprx-direct
 - VLESS+gRPC+TLS【支持CDN、IPv6、延迟低】
 - VLESS+WS+TLS【支持CDN、IPv6】
 - Trojan+TCP+TLS【**推荐**】
-- Trojan+TCP+xtls-rprx-direct【**推荐**】
+- Trojan+TCP+xtls-rprx-direct
 - Trojan+gRPC+TLS【支持CDN、IPv6、延迟低】
 - VMess+WS+TLS【支持CDN、IPv6】
 
@@ -68,12 +66,6 @@
 - 广移/CN2+Cloudflare+全球
 - 广移/CN2/南联+香港AZ+全球
 - 中转+cloudflare+落地机【可拉全球】
-
-## 组合推荐
-
-- 中转/gia/AS4837/AS9929 ---> VLESS+TCP+TLS/XTLS、Trojan
-- 移动宽带 ---> VMESS+WS+TLS/VLESS+WS+TLS/VLESS+gRPC+TLS/Trojan+gRPC+TLS + Cloudflare
-- cloudflare-> VLESS+gRPC+TLS/Trojan+gRPC+TLS[多路复用、延迟低]
 
 ## 注意事项
 
@@ -113,6 +105,12 @@
 
 ```
 wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" && chmod 700 /root/install.sh && /root/install.sh
+```
+
+- shadowsocks 动态IP白名单模式【Beta】
+
+```
+wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/mack-a/v2ray-agent/dev_ss/install.sh" && chmod 700 /root/install.sh && /root/install.sh
 ```
 
 # 示例图
